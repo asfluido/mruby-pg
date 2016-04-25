@@ -1,3 +1,6 @@
+class Pg_blob < String
+end
+
 module PG
   class Connection
     CONNECT_ARGUMENT_ORDER = %w[host port options tty dbname user password]

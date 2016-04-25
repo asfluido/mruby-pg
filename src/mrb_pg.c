@@ -15,6 +15,8 @@
 #include "libpq/libpq-fs.h"
 #include "pg_config_manual.h"
 
+#include "type-oids.h"
+
 #define mrb_mPG(mrb) (mrb_module_get(mrb, "PG"))
 #define mrb_cPGconn(mrb) (mrb_class_get_under(mrb, mrb_mPG(mrb), "Connection"))
 #define mrb_ePGerror(mrb) (mrb_class_get_under(mrb, mrb_mPG(mrb), "Error"))
@@ -493,6 +495,128 @@ pgconn_exec(mrb_state *mrb, mrb_value self)
   return mrb_pgresult;
 }
 
+static mrb_value pgconn_exec_carlo(mrb_state *mrb,mrb_value self)
+{
+  PGconn *conn=pg_get_pgconn(mrb,self);
+  mrb_value command,params,block,param,v;
+  int argc=mrb_get_args(mrb,"S|A&",&command,&params,&block);
+  int n_params=(argc==1) ? 0 : RARRAY_LEN(params);
+  char *param_values[n_params];
+  int param_lengths[n_params],param_formats[n_params],i,j,slen;
+
+  for(i=0;i<n_params;i++)
+  {
+    param=mrb_ary_entry(params,i);
+
+    if(mrb_nil_p(param))
+    {
+      param_values[i]=NULL;
+      param_lengths[i]=0;
+      param_formats[i]=0;      
+    }
+    else
+    {      
+      switch(mrb_type(param))
+      {
+      case MRB_TT_STRING:
+	slen=RSTRING_LEN(param);
+	if(mrb_obj_is_kind_of(mrb,param,mrb_class_get(mrb,"Pg_blob")))
+	{
+	  param_values[i]=mrb_malloc(mrb,slen);
+	  memcpy(param_values[i],RSTRING_PTR(param),slen);
+	  param_lengths[i]=slen;
+	  param_formats[i]=1;
+	}
+	else
+	{
+	  param_values[i]=mrb_malloc(mrb,slen+1);
+	  memcpy(param_values[i],RSTRING_PTR(param),slen);
+	  param_values[i][slen]='\0';
+	  
+	  param_lengths[i]=0;
+	  param_formats[i]=0;
+	}
+	break;
+      default:
+	v=mrb_obj_as_string(mrb,param);
+	slen=RSTRING_LEN(v);
+	param_values[i]=mrb_malloc(mrb,slen+1);
+	memcpy(param_values[i],RSTRING_PTR(v),slen);
+	param_values[i][slen]='\0';
+
+	param_lengths[i]=0;
+	param_formats[i]=0;
+      }    
+    }
+  }
+  
+  PGresult *result=PQexecParams(conn,RSTRING_PTR(command),n_params,NULL,(const char * const*)param_values,param_lengths,param_formats,0);
+
+  for(i=0;i<n_params;i++)
+    mrb_free(mrb,param_values[i]);
+
+  if(result==NULL)
+    mrb_raisef(mrb,E_TYPE_ERROR,"%S: Error executing PG query (%S)",mrb_str_new_cstr(mrb,__func__),
+	       mrb_str_new_cstr(mrb,PQerrorMessage(conn)));
+
+  int res_stat=PQresultStatus(result);
+
+  if(res_stat==PGRES_BAD_RESPONSE || res_stat==PGRES_FATAL_ERROR || res_stat==PGRES_NONFATAL_ERROR)
+    mrb_raisef(mrb,E_TYPE_ERROR,"%S: Error in PG result (%S)",mrb_str_new_cstr(mrb,__func__),
+	       mrb_str_new_cstr(mrb,PQresultErrorMessage(result)));
+  
+  int n_fields=PQnfields(result),n_res=PQntuples(result),iret;
+  double dret;
+  mrb_value to_ret=mrb_ary_new_capa(mrb,n_res);
+  char *str,*to;
+  size_t to_len;
+
+  for(i=0;i<n_res;i++)
+  {
+    v=mrb_ary_new_capa(mrb,n_fields);
+    for(j=0;j<n_fields;j++)
+    {
+      if(PQgetisnull(result,i,j))
+	mrb_ary_set(mrb,v,j,mrb_nil_value());
+      else
+      {
+	str=PQgetvalue(result,i,j);
+	switch(PQftype(result,j))
+	{
+	case BOOLOID:
+	  mrb_ary_set(mrb,v,j,(*str=='t') ? mrb_true_value() : mrb_false_value());
+	  break;
+	case BYTEAOID:
+	  to=(char *)PQunescapeBytea((unsigned char *)str,&to_len);
+	  mrb_ary_set(mrb,v,j,mrb_str_new(mrb,to,to_len));
+	  PQfreemem(to);
+	  break;
+	case NUMERICOID:
+	case INT8OID:
+	case INT4OID:
+	case INT2OID:
+	  sscanf(str,"%d",&iret);
+	  mrb_ary_set(mrb,v,j,mrb_fixnum_value(iret));
+	  break;
+	case FLOAT8OID:
+	case FLOAT4OID:
+	  sscanf(str,"%f",&dret);
+	  mrb_ary_set(mrb,v,j,mrb_float_value(mrb,dret));
+	  break;
+	default:
+	  mrb_ary_set(mrb,v,j,mrb_str_new_cstr(mrb,str));
+	}
+      }
+    }
+    mrb_ary_set(mrb,to_ret,i,v);
+  }
+
+  if(!mrb_nil_p(block))
+    return mrb_funcall_with_block(mrb,to_ret,mrb_intern_lit(mrb,"each"),0,NULL,block);
+
+  return to_ret;
+}
+
 /****************************************************************
  * mrb init/final
  ****************************************************************/
@@ -512,8 +636,8 @@ mrb_mruby_pg_gem_init(mrb_state* mrb) {
   mrb_define_method(mrb, _cPGconn, "setdblogin", pgconn_init, MRB_ARGS_OPT(1));
   mrb_define_method(mrb, _cPGconn, "exec", pgconn_exec, MRB_ARGS_REQ(1));
   mrb_define_method(mrb, _cPGconn, "exec_params", pgconn_exec_params, MRB_ARGS_REQ(2));
+  mrb_define_method(mrb, _cPGconn, "exec_carlo", pgconn_exec_carlo,MRB_ARGS_REQ(1)|MRB_ARGS_OPT(1));
   mrb_define_method(mrb, _cPGconn, "get_result", pgconn_get_result, MRB_ARGS_NONE());
-  
 
   mrb_define_class_under(mrb, _mPG, "Error", mrb->eStandardError_class);
 
