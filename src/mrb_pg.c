@@ -249,9 +249,9 @@ const struct mrb_data_type mrb_pgconn_type = {
 static mrb_value
 pgconn_init(mrb_state *mrb, mrb_value self)
 {
-  PGconn *conn = NULL;
-  mrb_value *argv;
-  int argc;
+  PGconn *conn=NULL;
+  mrb_value *argv=NULL;
+  mrb_int argc;
   mrb_value conninfo;
 
   argc = mrb_get_args(mrb, "*", &argv, &argc);
@@ -610,6 +610,8 @@ static mrb_value pgconn_exec_carlo(mrb_state *mrb,mrb_value self)
     }
     mrb_ary_set(mrb,to_ret,i,v);
   }
+
+  PQclear(result);
 
   if(!mrb_nil_p(block))
     return mrb_funcall_with_block(mrb,to_ret,mrb_intern_lit(mrb,"each"),0,NULL,block);
